@@ -79,7 +79,7 @@ static unsigned int up_min_freq;
  * to minimize wakeup issues.
  * Set sleep_max_freq=0 to disable this behavior.
  */
-#define DEFAULT_SLEEP_MAX_FREQ 576000
+#define DEFAULT_SLEEP_MAX_FREQ 594000
 static unsigned int sleep_max_freq;
 
 /*
