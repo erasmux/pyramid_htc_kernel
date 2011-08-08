@@ -55,7 +55,8 @@ static struct work_struct freq_scale_work;
 static u64 freq_change_time;
 static u64 freq_change_time_in_idle;
 
-static cpumask_t work_cpumask;
+//static cpumask_t work_cpumask;
+static struct cpumask work_cpumask;
 static unsigned int suspended;
 
 /*
@@ -245,7 +246,8 @@ static void cpufreq_smartass_freq_change_time_work(struct work_struct *work)
 	unsigned int new_freq;
 	struct smartass_info_s *this_smartass;
 	struct cpufreq_policy *policy;
-	cpumask_t tmp_mask = work_cpumask;
+//	cpumask_t tmp_mask = work_cpumask;
+	const struct cpumask *tmp_mask = &work_cpumask;
 	for_each_cpu(cpu, tmp_mask) {
 		this_smartass = &per_cpu(smartass_info, cpu);
 		policy = this_smartass->cur_policy;
