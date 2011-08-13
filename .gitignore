@@ -34,4 +34,5 @@ drivers/video/backlight/lcd.ko
 drivers/video/backlight/lcd.mod.c
 lib/lib.a
 vmlinux
+*.old
 
