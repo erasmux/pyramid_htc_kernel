@@ -13,6 +13,7 @@
  * GNU General Public License for more details.
  *
  * Author: Erasmux
+ * Modded by: faux123 for SMP compatibility
  *
  * Based on the interactive governor By Mike Chan (mike@android.com)
  * which was adaptated to 2.6.29 kernel by Nadlabak (pavel@doshaska.net)
@@ -42,6 +43,7 @@ struct smartass_info_s {
 	struct timer_list timer;
 	u64 time_in_idle;
 	u64 idle_exit_time;
+	int idling;
 	unsigned int force_ramp_up;
 	unsigned int enable;
 };
@@ -56,6 +58,7 @@ static u64 freq_change_time;
 static u64 freq_change_time_in_idle;
 
 static cpumask_t work_cpumask;
+static spinlock_t cpumask_lock;
 static unsigned int suspended;
 
 /*
@@ -131,6 +134,8 @@ static void cpufreq_smartass_timer(unsigned long data)
 	u64 delta_idle;
 	u64 update_time;
 	u64 now_idle;
+	unsigned long flags;
+
 	struct smartass_info_s *this_smartass = &per_cpu(smartass_info, data);
 	struct cpufreq_policy *policy = this_smartass->cur_policy;
 
@@ -151,7 +156,9 @@ static void cpufreq_smartass_timer(unsigned long data)
 			return;
 
 		this_smartass->force_ramp_up = 1;
+		spin_lock_irqsave(&cpumask_lock, flags);
 		cpumask_set_cpu(data, &work_cpumask);
+		spin_unlock_irqrestore(&cpumask_lock, flags);
 		queue_work(up_wq, &freq_scale_work);
 		return;
 	}
@@ -179,7 +186,9 @@ static void cpufreq_smartass_timer(unsigned long data)
 	if (cputime64_sub(update_time, freq_change_time) < down_rate_us)
 		return;
 
+	spin_lock_irqsave(&cpumask_lock, flags);
 	cpumask_set_cpu(data, &work_cpumask);
+	spin_unlock_irqrestore(&cpumask_lock, flags);
 	queue_work(down_wq, &freq_scale_work);
 }
 
@@ -187,11 +196,46 @@ static void cpufreq_idle(void)
 {
 	struct smartass_info_s *this_smartass = &per_cpu(smartass_info, smp_processor_id());
 	struct cpufreq_policy *policy = this_smartass->cur_policy;
+	int pending;
+	unsigned long flags;
+
+	if (!this_smartass->enable) {
+		pm_idle_old();
+		return;
+	}
+
+	this_smartass->idling = 1;
+	smp_wmb();
+	pending = timer_pending(&this_smartass->timer);
+
+	if (this_smartass->cur_policy->cur != this_smartass->cur_policy->min) {
+#ifdef CONFIG_SMP
+		/*
+		 * Entering idle while not at lowest speed.  On some
+		 * platforms this can hold the other CPU(s) at that speed
+		 * even though the CPU is idle. Set a timer to re-evaluate
+		 * speed so this idle CPU doesn't hold the other CPUs above
+		 * min indefinitely.  This should probably be a quirk of
+		 * the CPUFreq driver.
+		 */
+		if (!pending) {
+			this_smartass->time_in_idle = get_cpu_idle_time_us(
+				smp_processor_id(), &this_smartass->idle_exit_time);
+			mod_timer(&this_smartass->timer, jiffies + 2);
+		}
+#endif
+	}
 
 	pm_idle_old();
+	this_smartass->idling = 0;
+	smp_wmb();
 
-	if (!cpumask_test_cpu(smp_processor_id(), policy->cpus))
-			return;
+	spin_lock_irqsave(&cpumask_lock, flags);
+	if (!cpumask_test_cpu(smp_processor_id(), policy->cpus)) {
+		spin_unlock_irqrestore(&cpumask_lock, flags);
+		return;
+	}
+	spin_unlock_irqrestore(&cpumask_lock, flags);
 
 	/* Timer to fire in 1-2 ticks, jiffie aligned. */
 	if (timer_pending(&this_smartass->timer) == 0) {
@@ -245,8 +289,14 @@ static void cpufreq_smartass_freq_change_time_work(struct work_struct *work)
 	unsigned int new_freq;
 	struct smartass_info_s *this_smartass;
 	struct cpufreq_policy *policy;
-	cpumask_t *tmp_mask = &work_cpumask;
-	for_each_cpu(cpu, tmp_mask) {
+	unsigned long flags;
+	cpumask_t tmp_mask;
+
+	spin_lock_irqsave(&cpumask_lock, flags);
+	tmp_mask = work_cpumask;
+	spin_unlock_irqrestore(&cpumask_lock, flags);
+
+	for_each_cpu(cpu, &tmp_mask) {
 		this_smartass = &per_cpu(smartass_info, cpu);
 		policy = this_smartass->cur_policy;
 
@@ -254,7 +304,9 @@ static void cpufreq_smartass_freq_change_time_work(struct work_struct *work)
 			this_smartass->force_ramp_up = 0;
 
 			if (nr_running() == 1) {
+				spin_lock_irqsave(&cpumask_lock, flags);
 				cpumask_clear_cpu(cpu, &work_cpumask);
+				spin_unlock_irqrestore(&cpumask_lock, flags);
 				return;
 			}
 
@@ -293,10 +345,12 @@ static void cpufreq_smartass_freq_change_time_work(struct work_struct *work)
 		__cpufreq_driver_target(policy, new_freq,
 					CPUFREQ_RELATION_L);
 
+		spin_lock_irqsave(&cpumask_lock, flags);
 		freq_change_time_in_idle = get_cpu_idle_time_us(cpu,
 							&freq_change_time);
 
 		cpumask_clear_cpu(cpu, &work_cpumask);
+		spin_unlock_irqrestore(&cpumask_lock, flags);
 	}
 
 
@@ -468,6 +522,7 @@ static int cpufreq_governor_smartass(struct cpufreq_policy *new_policy,
 {
 	unsigned int cpu = new_policy->cpu;
 	int rc;
+
 	struct smartass_info_s *this_smartass = &per_cpu(smartass_info, cpu);
 	
 	switch (event) {
@@ -500,9 +555,9 @@ static int cpufreq_governor_smartass(struct cpufreq_policy *new_policy,
 		// notice no break here!
 
 	case CPUFREQ_GOV_LIMITS:
-		if (this_smartass->cur_policy->cur != new_policy->max)
+		if (this_smartass->cur_policy->cur != new_policy->max) {
 			__cpufreq_driver_target(new_policy, new_policy->max, CPUFREQ_RELATION_H);
-
+		}
 		break;
 
 	case CPUFREQ_GOV_STOP:
@@ -599,6 +654,8 @@ static int __init cpufreq_smartass_init(void)
 	down_wq = create_workqueue("ksmartass_down");
 
 	INIT_WORK(&freq_scale_work, cpufreq_smartass_freq_change_time_work);
+
+	spin_lock_init(&cpumask_lock);
 
 	register_early_suspend(&smartass_power_suspend);
 
